@@ -83,6 +83,7 @@ SECTIONS
         *(EXCLUDE_FILE(*crtend?.o *crtend.o) .dtors)
         *(SORT(.dtors.*))
         *(.dtors)
+        PROVIDE(__dso_handle = 0);
 
         *(.eh_frame*)
         . = ALIGN(4);
