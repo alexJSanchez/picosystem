@@ -1,0 +1,778 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skate Board Diorama</title>
+<style>
+  :root { color-scheme: light; }
+  html, body { margin: 0; background: #E9E4D8; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #2E3440; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 20px 16px 28px; }
+  #stage { position: relative; width: 100%; height: 560px; border-radius: 16px; overflow: hidden; background: #BFD9E8;
+           box-shadow: 0 6px 24px rgba(46, 52, 64, 0.18); touch-action: none; cursor: grab; }
+  #stage:active { cursor: grabbing; }
+  #stage canvas { display: block; width: 100%; height: 100%; transition: filter 0.15s; }
+  #flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+  #stamp { position: absolute; left: 50%; top: 18%; transform: translate(-50%, 0) rotate(-6deg); opacity: 0; pointer-events: none;
+           background: #C8553D; color: #F1E3C6; border: 4px solid #2a2230; padding: 6px 22px 8px; font-weight: 800; font-size: 40px;
+           letter-spacing: 0.04em; line-height: 1; font-family: "Arial Narrow", "Helvetica Neue", Arial, sans-serif; font-stretch: condensed;
+           box-shadow: 4px 4px 0 rgba(42, 34, 48, 0.55); text-transform: uppercase; }
+  .ui { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 22px; padding: 14px 4px 0; font-size: 14px; }
+  .ui label { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+  .ui input { width: 18px; height: 18px; accent-color: #3F8F8B; }
+  .hint { margin-left: auto; color: #5b6170; }
+  @media (max-width: 640px) { #stage { height: 420px; } #stamp { font-size: 28px; } .hint { margin-left: 0; width: 100%; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="stage"><div id="flash"></div><div id="stamp">New spot</div></div>
+  <div class="ui">
+    <label><input type="checkbox" id="chkOutline" checked> Outlines</label>
+    <label><input type="checkbox" id="chkSquint"> Squint test</label>
+    <span class="hint">Drag to rotate, scroll to zoom.</span>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // ------------------------------------------------------------------------
+  // palette
+  // ------------------------------------------------------------------------
+  var P = {
+    terracotta: 0xC8553D, brick: 0x9E3F32, cream: 0xF1E3C6, tan: 0xE8C9A8,
+    teal: 0x3F8F8B, deepTeal: 0x2E5E63, slate: 0x4F6FA3,
+    asphalt: 0x4A4A52, street: 0xB9B4A8, ink: 0x2E3440, outline: 0x2a2230,
+    mustard: 0xF2B632   // reserved: owned-spot flags only
+  };
+  function HEX(n) { return '#' + ('000000' + n.toString(16)).slice(-6); }
+
+  // seeded random so the scene is identical every load
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rnd = mulberry32(20240607);
+  function rr(a, b) { return a + (b - a) * rnd(); }
+  function pick(arr) { return arr[Math.floor(rnd() * arr.length)]; }
+
+  // ------------------------------------------------------------------------
+  // renderer, scene, camera
+  // ------------------------------------------------------------------------
+  var stage = document.getElementById('stage');
+  var renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  stage.insertBefore(renderer.domElement, stage.firstChild);
+
+  var scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xBFD9E8);
+
+  var camera = new THREE.OrthographicCamera(-10, 10, 10, -10, 0.1, 140);
+  var az = Math.PI / 4;
+  var EL = Math.atan(1 / Math.SQRT2);
+  var DIST = 40, zoom = 0.8;       // starts a touch wide so the whole slab fits; the 0.7-2.6 range still applies
+  var target = new THREE.Vector3(0, 1.2, 0);
+
+  function placeCamera() {
+    camera.position.set(
+      target.x + DIST * Math.cos(EL) * Math.sin(az),
+      target.y + DIST * Math.sin(EL),
+      target.z + DIST * Math.cos(EL) * Math.cos(az));
+    camera.lookAt(target);
+    camera.zoom = zoom;
+    camera.updateProjectionMatrix();
+  }
+
+  function resize() {
+    var w = stage.clientWidth, h = stage.clientHeight;
+    renderer.setSize(w, h, false);
+    var aspect = w / h;
+    camera.left = -10; camera.right = 10;
+    camera.top = 10 / aspect; camera.bottom = -10 / aspect;
+    placeCamera();
+  }
+  window.addEventListener('resize', resize);
+
+  // lighting: no PBR, one warm sun
+  scene.add(new THREE.HemisphereLight(0xdfe8f2, 0x7a7064, 0.8));
+  var sun = new THREE.DirectionalLight(0xfff0d8, 0.5);
+  sun.position.set(-7, 16, 10);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.camera.left = -10; sun.shadow.camera.right = 10;
+  sun.shadow.camera.top = 10; sun.shadow.camera.bottom = -10;
+  sun.shadow.camera.near = 1; sun.shadow.camera.far = 50;
+  sun.shadow.bias = -0.0008;
+  scene.add(sun);
+
+  // ------------------------------------------------------------------------
+  // helpers
+  // ------------------------------------------------------------------------
+  var matCache = {};
+  function M(c) {
+    if (!matCache[c]) matCache[c] = new THREE.MeshLambertMaterial({ color: c });
+    return matCache[c];
+  }
+  var outlineMat = new THREE.MeshBasicMaterial({ color: P.outline, side: THREE.BackSide });
+  var outlines = [];
+
+  // inverted hull: same geometry, back faces only, scaled up a little around the bbox centre
+  function addOutline(mesh, t) {
+    var g = mesh.geometry;
+    if (!g.boundingBox) g.computeBoundingBox();
+    var s = new THREE.Vector3(), c = new THREE.Vector3();
+    g.boundingBox.getSize(s); g.boundingBox.getCenter(c);
+    var sx = (s.x + 2 * t) / Math.max(s.x, 1e-4);
+    var sy = (s.y + 2 * t) / Math.max(s.y, 1e-4);
+    var sz = (s.z + 2 * t) / Math.max(s.z, 1e-4);
+    var o = new THREE.Mesh(g, outlineMat);
+    o.scale.set(sx, sy, sz);
+    o.position.set(c.x * (1 - sx), c.y * (1 - sy), c.z * (1 - sz));
+    mesh.add(o);
+    outlines.push(o);
+    return o;
+  }
+
+  function place(m, parent, x, y, z, t) {
+    m.position.set(x || 0, y || 0, z || 0);
+    m.castShadow = true; m.receiveShadow = true;
+    if (parent) parent.add(m);
+    if (t) addOutline(m, t);
+    return m;
+  }
+  function mat(m) { return typeof m === 'number' ? M(m) : m; }
+  function box(parent, w, h, d, m, x, y, z, t) {
+    return place(new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat(m)), parent, x, y, z, t);
+  }
+  function cyl(parent, rt, rb, h, seg, m, x, y, z, t) {
+    return place(new THREE.Mesh(new THREE.CylinderGeometry(rt, rb, h, seg), mat(m)), parent, x, y, z, t);
+  }
+  function sph(parent, r, m, x, y, z, ws, hs) {
+    return place(new THREE.Mesh(new THREE.SphereGeometry(r, ws || 10, hs || 8), mat(m)), parent, x, y, z, 0);
+  }
+
+  function ctex(w, h, fn) {
+    var c = document.createElement('canvas');
+    c.width = Math.max(2, Math.round(w)); c.height = Math.max(2, Math.round(h));
+    fn(c.getContext('2d'), c.width, c.height);
+    var t = new THREE.CanvasTexture(c);
+    t.generateMipmaps = false;
+    t.minFilter = THREE.LinearFilter;
+    t.magFilter = THREE.LinearFilter;
+    return t;
+  }
+  function texMat(tex) { return new THREE.MeshLambertMaterial({ map: tex }); }
+
+  // ------------------------------------------------------------------------
+  // painted textures
+  // ------------------------------------------------------------------------
+  var CURTAINS = [HEX(P.teal), HEX(P.terracotta), HEX(P.slate), HEX(P.tan)];
+
+  function paintWall(g, W, H, o) {
+    var u = 128;
+    g.fillStyle = o.color; g.fillRect(0, 0, W, H);
+
+    // soft top light and brushed vertical highlights
+    var top = g.createLinearGradient(0, 0, 0, H * 0.45);
+    top.addColorStop(0, 'rgba(255,248,230,0.30)'); top.addColorStop(1, 'rgba(255,248,230,0)');
+    g.fillStyle = top; g.fillRect(0, 0, W, H);
+    g.fillStyle = 'rgba(255,250,235,0.26)'; g.fillRect(0, 0, 4, H);
+    g.fillStyle = 'rgba(30,20,30,0.22)'; g.fillRect(W - 5, 0, 5, H);
+    for (var i = 0; i < 9; i++) {      // painterly streaks
+      g.fillStyle = rnd() < 0.5 ? 'rgba(255,245,225,0.06)' : 'rgba(30,20,30,0.05)';
+      g.fillRect(rnd() * W, 0, 2 + rnd() * 5, H);
+    }
+
+    // window grid
+    var shopPx = o.shop ? Math.round(0.86 * u) : 0;
+    var topPad = 0.2 * u;
+    var areaH = H - shopPx - topPad - 0.08 * u;
+    var floors = Math.max(1, Math.round(areaH / (0.62 * u)));
+    var cols = Math.max(2, Math.round(W / (0.42 * u)));
+    var cw = W / cols, fh = areaH / floors;
+    var ww = cw * 0.56, wh = fh * 0.62;
+    for (var f = 0; f < floors; f++) {
+      for (var c = 0; c < cols; c++) {
+        var x = c * cw + (cw - ww) / 2, y = topPad + f * fh + (fh - wh) / 2;
+        g.fillStyle = 'rgba(30,20,30,0.25)'; g.fillRect(x - 2, y + wh + 3, ww + 4, 5);
+        g.fillStyle = HEX(P.cream); g.fillRect(x - 3, y - 3, ww + 6, wh + 6);
+        var lit = rnd() < 0.2;
+        g.fillStyle = lit ? '#F8E3A6' : HEX(P.ink); g.fillRect(x, y, ww, wh);
+        if (lit) {
+          g.fillStyle = 'rgba(255,255,255,0.35)'; g.fillRect(x, y, ww, wh * 0.25);
+        } else {
+          g.fillStyle = 'rgba(120,160,190,0.30)';
+          g.beginPath(); g.moveTo(x, y); g.lineTo(x + ww * 0.55, y); g.lineTo(x, y + wh * 0.55); g.fill();
+          if (rnd() < 0.3) { g.fillStyle = pick(CURTAINS); g.fillRect(x, y, ww, wh * 0.46); }
+        }
+        g.fillStyle = HEX(P.cream);
+        g.fillRect(x + ww / 2 - 1.5, y, 3, wh); g.fillRect(x, y + wh / 2 - 1.5, ww, 3);
+      }
+    }
+
+    // ground floor shopfront
+    if (o.shop) {
+      var sy = H - shopPx;
+      g.fillStyle = 'rgba(30,20,30,0.30)'; g.fillRect(0, sy, W, 4);
+      var doorLeft = rnd() < 0.5;
+      var dw = Math.min(0.34 * u, W * 0.3);
+      var dx = doorLeft ? W * 0.07 : W - W * 0.07 - dw;
+      var wx = doorLeft ? dx + dw + W * 0.05 : W * 0.07;
+      var wwid = W - dw - W * 0.07 * 2 - W * 0.05;
+      var wy = sy + 0.2 * u, wh2 = shopPx - 0.26 * u;
+      g.fillStyle = HEX(P.cream); g.fillRect(wx - 4, wy - 4, wwid + 8, wh2 + 8);
+      g.fillStyle = HEX(P.ink); g.fillRect(wx, wy, wwid, wh2);
+      var glow = g.createLinearGradient(0, wy, 0, wy + wh2);
+      glow.addColorStop(0, 'rgba(255,214,140,0.55)'); glow.addColorStop(1, 'rgba(255,214,140,0.10)');
+      g.fillStyle = glow; g.fillRect(wx, wy, wwid, wh2);
+      g.fillStyle = HEX(P.cream); g.fillRect(wx + wwid / 2 - 2, wy, 4, wh2);
+      // door
+      g.fillStyle = HEX(P.cream); g.fillRect(dx - 4, sy + 0.1 * u - 4, dw + 8, shopPx - 0.1 * u + 4);
+      g.fillStyle = HEX(pick([P.deepTeal, P.brick, P.slate])); g.fillRect(dx, sy + 0.1 * u, dw, shopPx - 0.1 * u);
+      g.fillStyle = HEX(P.ink); g.fillRect(dx + dw * 0.2, sy + 0.16 * u, dw * 0.6, 0.3 * u);
+      g.fillStyle = HEX(P.cream); g.fillRect(dx + dw * 0.78, sy + 0.5 * u, 5, 9);
+    }
+
+    // grime toward the ground
+    var gr = g.createLinearGradient(0, H, 0, H * 0.5);
+    gr.addColorStop(0, 'rgba(38,24,28,0.45)'); gr.addColorStop(1, 'rgba(38,24,28,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, W, H);
+  }
+
+  function fitText(g, text, W, H, color, weight) {
+    var size = H * 0.62;
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    do {
+      g.font = (weight || 'bold') + ' ' + size + 'px "Arial Narrow", "Helvetica Neue", Arial, sans-serif';
+      size -= 2;
+    } while (g.measureText(text).width > W * 0.86 && size > 8);
+    g.fillStyle = color;
+    g.fillText(text, W / 2, H / 2 + 2);
+  }
+
+  function makeSign(text, w, h, bg, fg) {
+    var tex = ctex(w * 170, h * 170, function (g, W, H) {
+      g.fillStyle = HEX(bg); g.fillRect(0, 0, W, H);
+      g.strokeStyle = HEX(P.outline); g.lineWidth = 6; g.strokeRect(3, 3, W - 6, H - 6);
+      fitText(g, text, W, H, HEX(fg));
+    });
+    var m = texMat(tex), plain = M(P.ink);
+    return new THREE.Mesh(new THREE.BoxGeometry(w, h, 0.07), [plain, plain, plain, plain, m, plain]);
+  }
+
+  function stripeTex(c1, c2) {
+    return ctex(128, 128, function (g, W, H) {
+      for (var i = 0; i < 8; i++) { g.fillStyle = HEX(i % 2 ? c2 : c1); g.fillRect(i * W / 8, 0, W / 8 + 1, H); }
+      var s = g.createLinearGradient(0, 0, 0, H); s.addColorStop(0, 'rgba(255,255,255,0.18)'); s.addColorStop(1, 'rgba(0,0,0,0.15)');
+      g.fillStyle = s; g.fillRect(0, 0, W, H);
+    });
+  }
+
+  // ------------------------------------------------------------------------
+  // buildings
+  // ------------------------------------------------------------------------
+  var GROUND = 0.1;   // pavement top
+  var NAMES = ['KICKS', 'RAMEN', 'DECKS', 'CAFE', 'BAR', 'TAPES', 'NOODLE', 'PIZZA', 'ARCADE', 'SUSHI', 'GRIND', 'TACOS'];
+  var nameIx = 0;
+  function nextName() { return NAMES[nameIx++ % NAMES.length]; }
+  var WARM = [P.terracotta, P.brick, P.cream, P.tan];
+  var COOL = [P.teal, P.deepTeal, P.slate];
+
+  function makeBuilding(o) {
+    var g = new THREE.Group();
+    var w = o.w, h = o.h, d = o.d;
+    var wallHex = HEX(o.wall);
+    var mF = texMat(ctex(w * 128, h * 128, function (c, W, H) { paintWall(c, W, H, { color: wallHex, shop: true }); }));
+    var mS = texMat(ctex(d * 128, h * 128, function (c, W, H) { paintWall(c, W, H, { color: wallHex, shop: !!o.frontX }); }));
+    var mB = texMat(ctex(w * 128, h * 128, function (c, W, H) { paintWall(c, W, H, { color: wallHex, shop: false }); }));
+    var mats = [o.frontX ? mF : mS, mS, M(o.wall), M(P.ink), mF, mB];
+    box(g, w, h, d, mats, 0, h / 2, 0, 0.05);
+
+    // sign above the shopfront
+    var signBg = pick([P.cream, P.tan, P.ink, P.deepTeal]);
+    var signFg = (signBg === P.ink || signBg === P.deepTeal) ? P.cream : pick([P.brick, P.deepTeal, P.ink]);
+    var sw = Math.min(w * 0.84, o.signW || 9), sh = o.signH || 0.2;
+    var sign = makeSign(o.name, sw, sh, signBg, signFg);
+    place(sign, g, 0, 0.99, d / 2 + 0.04, 0);
+    if (o.frontX) {
+      var sign2 = makeSign(o.name, Math.min(d * 0.84, o.signW || 9), sh, signBg, signFg);
+      place(sign2, g, w / 2 + 0.04, 0.99, 0, 0); sign2.rotation.y = Math.PI / 2;
+    }
+
+    // striped awning
+    var aw1 = pick([P.terracotta, P.teal]);
+    var awTex = texMat(stripeTex(P.cream, aw1));
+    var awn = box(g, w * 0.9, 0.035, 0.34, [M(aw1), M(aw1), awTex, M(aw1), M(aw1), M(aw1)], 0, 0.82, d / 2 + 0.17, 0);
+    awn.rotation.x = 0.42;
+
+    // blade sign on taller, narrower buildings
+    if (h > 2.45 && w < 1.15 && !o.frontX) {
+      var bx = (rnd() < 0.5 ? -1 : 1) * (w / 2 - 0.06);
+      var bTex = texMat(ctex(96, 134, function (c, W, H) {
+        c.fillStyle = HEX(pick([P.terracotta, P.slate, P.deepTeal])); c.fillRect(0, 0, W, H);
+        c.strokeStyle = HEX(P.outline); c.lineWidth = 6; c.strokeRect(3, 3, W - 6, H - 6);
+        fitText(c, pick(['OPEN', 'BAR', 'FOOD', 'HOT']), W, H * 0.9, HEX(P.cream));
+      }));
+      var plain = M(P.ink);
+      place(new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.42, 0.3), [bTex, bTex, plain, plain, plain, plain]), g, bx, h * 0.62, d / 2 + 0.17, 0);
+      box(g, 0.03, 0.03, 0.2, P.ink, bx, h * 0.62 + 0.18, d / 2 + 0.1, 0);
+    }
+
+    // AC units with fan discs
+    var nAC = 1 + Math.floor(rnd() * 2);
+    for (var a = 0; a < nAC; a++) {
+      var ax = (rnd() < 0.5 ? -1 : 1) * (w / 2 - 0.2 - rnd() * 0.1);
+      var ay = rr(1.3, Math.max(1.4, h - 0.55));
+      box(g, 0.26, 0.2, 0.15, 0xD9D2C0, ax, ay, d / 2 + 0.075, 0.012);
+      var fan = cyl(g, 0.065, 0.065, 0.012, 14, P.ink, ax, ay, d / 2 + 0.16, 0);
+      fan.rotation.x = Math.PI / 2;
+    }
+
+    // vertical pipe on one edge
+    var px = (rnd() < 0.5 ? -1 : 1) * (w / 2 - 0.04);
+    cyl(g, 0.025, 0.025, h, 8, 0x6b6670, px, h / 2, d / 2 + 0.03, 0);
+
+    // balcony with a railing and plants
+    if (h > 2.4 && rnd() < 0.65) {
+      var bax = (rnd() < 0.5 ? -1 : 1) * (w * 0.18);
+      var by = 1.5 + rr(0, 0.5);
+      box(g, 0.5, 0.04, 0.22, P.tan, bax, by, d / 2 + 0.11, 0.012);
+      box(g, 0.5, 0.02, 0.02, P.ink, bax, by + 0.15, d / 2 + 0.21, 0);
+      for (var k = -2; k <= 2; k++) box(g, 0.012, 0.13, 0.012, P.ink, bax + k * 0.1, by + 0.085, d / 2 + 0.21, 0);
+      sph(g, 0.05, 0x6E9A62, bax - 0.14, by + 0.07, d / 2 + 0.08);
+      sph(g, 0.05, 0x7FA06B, bax + 0.16, by + 0.07, d / 2 + 0.08);
+    }
+
+    // roof
+    if (o.gable) {
+      var hw = w / 2 + 0.06, ph = 0.5 + (w - 0.9) * 0.3;
+      var sh2 = new THREE.Shape();
+      sh2.moveTo(-hw, 0); sh2.lineTo(hw, 0); sh2.lineTo(0, ph); sh2.lineTo(-hw, 0);
+      var gg = new THREE.ExtrudeGeometry(sh2, { depth: d + 0.1, bevelEnabled: false });
+      gg.translate(0, 0, -(d + 0.1) / 2);
+      var rf = place(new THREE.Mesh(gg, M(o.roof)), g, 0, h, 0, 0.04);
+      rf.castShadow = true;
+    } else {
+      box(g, w + 0.12, 0.1, d + 0.12, o.roof, 0, h + 0.05, 0, 0.025);
+      var rx = (rnd() < 0.5 ? -1 : 1) * w * 0.2;
+      if (rnd() < 0.55) {   // water tank with a cone roof
+        for (var l = 0; l < 4; l++) {
+          cyl(g, 0.012, 0.012, 0.16, 5, P.ink, rx + (l % 2 ? 0.09 : -0.09), h + 0.18, (l < 2 ? 0.07 : -0.07) - d * 0.1, 0);
+        }
+        cyl(g, 0.15, 0.15, 0.26, 12, pick([P.tan, P.brick]), rx, h + 0.39, -d * 0.1, 0.02);
+        cyl(g, 0.0, 0.19, 0.13, 12, P.deepTeal, rx, h + 0.585, -d * 0.1, 0.015);
+      }
+      if (rnd() < 0.6) {    // antenna
+        var ant = (rx > 0 ? -1 : 1) * w * 0.25;
+        cyl(g, 0.01, 0.01, 0.55, 6, P.ink, ant, h + 0.375, d * 0.15, 0);
+        box(g, 0.2, 0.012, 0.012, P.ink, ant, h + 0.5, d * 0.15, 0);
+        box(g, 0.14, 0.012, 0.012, P.ink, ant, h + 0.38, d * 0.15, 0);
+      }
+    }
+    return g;
+  }
+
+  function addSideBuildings(side, warm) {
+    var widths = [1.1, 0.9, 1.2, 0.9, 1.1];
+    var total = 5.2, cur = -total / 2;
+    var rot = { bottom: 0, left: -Math.PI / 2, top: Math.PI, right: Math.PI / 2 }[side];
+    for (var i = 0; i < 5; i++) {
+      var w = widths[i], c = cur + w / 2; cur += w;
+      var h = rr(2.0, 3.4), d = rr(1.5, 1.75);
+      var b = makeBuilding({
+        w: w, h: h, d: d, name: nextName(), gable: rnd() < 0.34,
+        wall: warm ? pick(WARM) : pick(COOL),
+        roof: warm ? pick(COOL) : pick([P.terracotta, P.brick])
+      });
+      var f = 4.25, off = f - d / 2;
+      if (side === 'bottom') b.position.set(c, GROUND, off);
+      if (side === 'top')    b.position.set(c, GROUND, -off);
+      if (side === 'left')   b.position.set(-off, GROUND, c);
+      if (side === 'right')  b.position.set(off, GROUND, c);
+      b.rotation.y = rot;
+      scene.add(b);
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // base slab, ring, sidewalk
+  // ------------------------------------------------------------------------
+  box(scene, 11.8, 0.5, 11.8, 0x7a7064, 0, -0.25, 0, 0.07);
+  box(scene, 10.4, 0.6, 10.4, 0x4a423a, 0, -0.8, 0, 0.06);
+  box(scene, 9.0, 0.1, 9.0, P.street, 0, GROUND / 2, 0, 0);      // paved interior
+
+  function tilePos(i) {
+    if (i <= 10) return { x: 5 - i, z: 5, side: i === 0 || i === 10 ? 'corner' : 'bottom' };
+    if (i <= 20) return { x: -5, z: 5 - (i - 10), side: i === 20 ? 'corner' : 'left' };
+    if (i <= 30) return { x: -5 + (i - 20), z: -5, side: i === 30 ? 'corner' : 'top' };
+    return { x: 5, z: -5 + (i - 30), side: 'right' };
+  }
+  var INWARD = { bottom: [0, -1], left: [1, 0], top: [0, 1], right: [-1, 0] };
+  var CURBS = {
+    bottom: [P.terracotta, P.brick], left: [P.teal, P.deepTeal],
+    top: [P.slate, P.teal], right: [P.brick, P.terracotta]
+  };
+  var CHANCE = { 7: 1, 22: 1, 36: 1 };
+
+  for (var ti = 0; ti < 40; ti++) {
+    var tp = tilePos(ti);
+    var corner = tp.side === 'corner';
+    var slab = box(scene, 0.98, 0.12, 0.98, corner ? 0x5B5B64 : P.asphalt, tp.x, 0.06, tp.z, 0);
+    slab.receiveShadow = true;
+    if (!corner) {
+      var iw = INWARD[tp.side], chance = CHANCE[ti];
+      var col = chance ? P.cream : CURBS[tp.side][ti % 2];
+      var cx = tp.x + iw[0] * 0.46, cz = tp.z + iw[1] * 0.46;
+      box(scene, iw[0] ? 0.08 : 0.98, 0.2, iw[1] ? 0.08 : 0.98, col, cx, 0.1, cz, 0);
+      if (chance) {   // a painted "?" on chance tiles
+        var q = ctex(64, 64, function (g, W, H) {
+          g.clearRect(0, 0, W, H); g.fillStyle = HEX(P.cream); g.font = 'bold 56px Arial'; g.textAlign = 'center'; g.textBaseline = 'middle';
+          g.fillText('?', W / 2, H / 2 + 3);
+        });
+        var qm = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 0.5), new THREE.MeshBasicMaterial({ map: q, transparent: true }));
+        qm.rotation.x = -Math.PI / 2; qm.position.set(tp.x, 0.125, tp.z);
+        scene.add(qm);
+      }
+    }
+  }
+
+  // sidewalk strip around the inside of the ring
+  var SW = 0xCFCABD;
+  box(scene, 8.9, 0.12, 0.17, SW, 0, 0.06, 4.335, 0);
+  box(scene, 8.9, 0.12, 0.17, SW, 0, 0.06, -4.335, 0);
+  box(scene, 0.17, 0.12, 8.9, SW, 4.335, 0.06, 0, 0);
+  box(scene, 0.17, 0.12, 8.9, SW, -4.335, 0.06, 0, 0);
+
+  // street lamps on the outer edge
+  [2, 5, 8, 12, 15, 18, 22, 25, 28, 32, 35, 38].forEach(function (i) {
+    var p = tilePos(i), o = { bottom: [0, 1], left: [-1, 0], top: [0, -1], right: [1, 0] }[p.side];
+    var lx = p.x + o[0] * 0.43, lz = p.z + o[1] * 0.43;
+    cyl(scene, 0.022, 0.03, 0.82, 6, P.ink, lx, 0.5, lz, 0);
+    cyl(scene, 0.012, 0.012, 0.16, 5, P.ink, lx - o[0] * 0.08, 0.9, lz - o[1] * 0.08, 0).rotation.set(o[1] ? Math.PI / 2 : 0, 0, o[0] ? Math.PI / 2 : 0);
+    var bulb = new THREE.Mesh(new THREE.SphereGeometry(0.07, 10, 8), new THREE.MeshBasicMaterial({ color: P.cream }));
+    bulb.position.set(lx - o[0] * 0.15, 0.9, lz - o[1] * 0.15);
+    scene.add(bulb);
+  });
+
+  // ------------------------------------------------------------------------
+  // the four sides and the corner landmarks
+  // ------------------------------------------------------------------------
+  addSideBuildings('bottom', true);
+  addSideBuildings('right', true);
+  addSideBuildings('left', false);
+  addSideBuildings('top', false);
+
+  function landmark(o, x, z) {
+    var b = makeBuilding(o);
+    b.position.set(x, GROUND, z);
+    scene.add(b);
+    return b;
+  }
+  // corner 0 (nearest): SKATE SHOP, two shopfronts facing the street
+  landmark({ w: 1.68, h: 2.9, d: 1.68, name: 'SKATE SHOP', wall: P.terracotta, roof: P.teal, gable: true, frontX: true, signH: 0.26 }, 3.56, 3.56);
+  // corner 10: POLICE
+  var pol = landmark({ w: 1.68, h: 2.5, d: 1.68, name: 'POLICE', wall: P.slate, roof: P.deepTeal, gable: false, frontX: true, signH: 0.26 }, -3.56, 3.56);
+  box(pol, 0.18, 0.12, 0.18, P.terracotta, -0.4, 2.5 + 0.16, 0, 0.015);
+  box(pol, 0.18, 0.12, 0.18, P.slate, 0.4, 2.5 + 0.16, 0, 0.015);
+  // corner 30: ALLEY
+  var alley = landmark({ w: 1.68, h: 2.7, d: 1.68, name: 'ALLEY', wall: P.deepTeal, roof: P.brick, gable: false, frontX: true, signH: 0.26 }, 3.56, -3.56);
+  box(alley, 0.5, 0.42, 0.34, P.deepTeal, 1.05, 0.21, 0.55, 0.02);              // dumpster
+  box(alley, 0.52, 0.05, 0.36, P.ink, 1.05, 0.44, 0.55, 0);
+
+  // corner 20: pocket park
+  box(scene, 1.7, 0.06, 1.7, 0x7FA06B, -3.56, GROUND + 0.03, -3.56, 0.03);
+  // icosahedron with one normal per face, so the foliage reads flat-shaded
+  function facets(r) {
+    var g = new THREE.IcosahedronGeometry(r, 0);
+    g.computeVertexNormals();
+    return g;
+  }
+  function tree(x, z, s) {
+    var t = new THREE.Group();
+    cyl(t, 0.07 * s, 0.09 * s, 0.5 * s, 6, 0x6b4f3a, 0, 0.25 * s, 0, 0);
+    var f1 = place(new THREE.Mesh(facets(0.34 * s), M(pick([0x6E9A62, 0x5E8A58, 0x7FA06B]))), t, 0, 0.72 * s, 0, 0);
+    var f2 = place(new THREE.Mesh(facets(0.24 * s), M(pick([0x7FA06B, 0x6E9A62]))), t, 0.12 * s, 1.0 * s, 0.05 * s, 0);
+    f1.rotation.y = rnd() * 3; f2.rotation.y = rnd() * 3;
+    t.position.set(x, GROUND, z);
+    scene.add(t);
+  }
+  function bench(x, z, rotY) {
+    var b = new THREE.Group();
+    box(b, 0.62, 0.05, 0.2, P.tan, 0, 0.2, 0, 0);
+    box(b, 0.62, 0.16, 0.04, P.tan, 0, 0.3, -0.1, 0);
+    box(b, 0.05, 0.2, 0.18, P.ink, -0.26, 0.1, 0, 0);
+    box(b, 0.05, 0.2, 0.18, P.ink, 0.26, 0.1, 0, 0);
+    b.position.set(x, GROUND, z); b.rotation.y = rotY;
+    scene.add(b);
+  }
+  tree(-3.95, -3.9, 1.1); tree(-3.1, -3.1, 0.9);
+  bench(-3.4, -4.1, 0);
+
+  // ------------------------------------------------------------------------
+  // plaza (kept quiet)
+  // ------------------------------------------------------------------------
+  var plazaTex = ctex(512, 512, function (g, W, H) {
+    var n = 16, cell = W / n;
+    for (var y = 0; y < n; y++) for (var x = 0; x < n; x++) {
+      g.fillStyle = (x + y) % 2 ? HEX(P.cream) : HEX(P.tan); g.fillRect(x * cell, y * cell, cell, cell);
+    }
+    g.lineWidth = 16; g.strokeStyle = HEX(P.terracotta); g.beginPath(); g.arc(W / 2, H / 2, 205, 0, 6.283); g.stroke();
+    g.lineWidth = 12; g.strokeStyle = HEX(P.teal);       g.beginPath(); g.arc(W / 2, H / 2, 170, 0, 6.283); g.stroke();
+    g.lineWidth = 10; g.strokeStyle = HEX(P.terracotta); g.beginPath(); g.arc(W / 2, H / 2, 128, 0, 6.283); g.stroke();
+    g.lineWidth = 8;  g.strokeStyle = HEX(P.teal);       g.beginPath(); g.arc(W / 2, H / 2, 96, 0, 6.283); g.stroke();
+    g.lineWidth = 22; g.strokeStyle = HEX(P.deepTeal);   g.strokeRect(11, 11, W - 22, H - 22);
+  });
+  var pm = M(P.deepTeal);
+  box(scene, 5.4, 0.1, 5.4, [pm, pm, texMat(plazaTex), pm, pm, pm], 0, GROUND + 0.05, 0, 0.02);
+
+  var PY = GROUND + 0.1;
+  // fountain
+  cyl(scene, 0.98, 1.02, 0.3, 28, P.street, 0, PY + 0.15, 0, 0.025);
+  cyl(scene, 0.84, 0.84, 0.04, 28, 0x7FBDB8, 0, PY + 0.28, 0, 0);
+  cyl(scene, 0.1, 0.14, 0.7, 10, P.street, 0, PY + 0.55, 0, 0.015);
+  cyl(scene, 0.4, 0.18, 0.14, 18, P.street, 0, PY + 0.92, 0, 0.02);
+  cyl(scene, 0.34, 0.34, 0.03, 18, 0x7FBDB8, 0, PY + 0.99, 0, 0);
+  cyl(scene, 0.0, 0.06, 0.34, 8, 0x9AD2CE, 0, PY + 1.17, 0, 0);
+  sph(scene, 0.07, 0x9AD2CE, 0, PY + 1.36, 0, 8, 6);
+  // benches and trees
+  bench(0, 2.25, Math.PI); bench(2.25, 0, -Math.PI / 2); bench(-2.25, 0.2, Math.PI / 2);
+  (function () {   // benches were placed in world space; lift them to plaza height
+    scene.children.slice(-3).forEach(function (b) { b.position.y = PY; });
+  })();
+  tree(-2.0, -2.05, 1.0); tree(1.9, 2.0, 0.95);
+
+  // ------------------------------------------------------------------------
+  // people
+  // ------------------------------------------------------------------------
+  var SKIN = [0xE0AC7E, 0xC98F63, 0xF0C8A0, 0x8D5A3C];
+
+  function makeFigure(s) {
+    var g = new THREE.Group();
+    var inner = new THREE.Group(); g.add(inner);
+    if (s.board !== false) {
+      var bc = s.board || 0xB9825A;
+      box(inner, 0.34, 0.022, 0.095, bc, 0, 0.062, 0, 0);
+      box(inner, 0.07, 0.022, 0.095, bc, 0.19, 0.078, 0, 0).rotation.z = 0.5;
+      box(inner, 0.07, 0.022, 0.095, bc, -0.19, 0.078, 0, 0).rotation.z = -0.5;
+      [-0.12, 0.12].forEach(function (wx) {
+        [-0.034, 0.034].forEach(function (wz) {
+          var wl = cyl(inner, 0.026, 0.026, 0.02, 10, P.cream, wx, 0.03, wz, 0); wl.rotation.x = Math.PI / 2;
+        });
+      });
+    }
+    var by = s.board === false ? 0 : 0.075;
+    var body = new THREE.Group(); body.position.y = by; inner.add(body);
+    var lh = s.legH, lw = s.legW;
+    [-1, 1].forEach(function (k) {
+      box(body, lw, lh, lw, s.pants, k * 0.075, lh / 2 + 0.02, 0, 0);
+      box(body, 0.075, 0.03, 0.055, P.cream, k * 0.085, 0.015, 0.012, 0);
+    });
+    var tg = new THREE.Group(); tg.position.y = lh + 0.02; tg.rotation.x = s.lean || 0; body.add(tg);
+    box(tg, s.torsoW, s.torsoH, 0.085, s.shirt, 0, s.torsoH / 2, 0, 0);
+    var armY = s.torsoH - 0.035;
+    [-1, 1].forEach(function (k) {
+      var arm = box(tg, 0.036, s.armL, 0.036, s.shirt, k * (s.torsoW / 2 + 0.012), armY - s.armL / 2 + 0.02, 0, 0);
+      if (s.armsForward) { arm.rotation.x = -1.2; arm.position.set(k * (s.torsoW / 2 + 0.012), armY - 0.02, s.armL * 0.4); }
+      else { arm.rotation.z = k * 0.55; arm.position.x += k * 0.035; }
+      box(arm, 0.04, 0.04, 0.04, s.skin, 0, -s.armL / 2, 0, 0);
+    });
+    var hy = s.torsoH + s.headR * 0.95;
+    sph(tg, s.headR, s.skin, 0, hy, 0, 10, 8);
+    var hr = s.headR;
+    if (s.hat === 'bucket') {
+      cyl(tg, hr * 1.1, hr * 1.2, 0.07, 10, s.hatCol, 0, hy + hr * 0.72, 0, 0);
+      cyl(tg, hr * 1.55, hr * 1.55, 0.015, 12, s.hatCol, 0, hy + hr * 0.5, 0, 0);
+    } else if (s.hat === 'beanie') {
+      sph(tg, hr * 1.12, s.hatCol, 0, hy + hr * 0.25, 0, 10, 8).scale.y = 0.95;
+      sph(tg, 0.03, P.cream, 0, hy + hr * 1.35, 0, 6, 5);
+    } else {
+      cyl(tg, hr * 1.04, hr * 1.04, 0.06, 10, s.hatCol, 0, hy + hr * 0.62, 0, 0);
+      box(tg, 0.1, 0.012, 0.08, s.hatCol, 0, hy + hr * 0.5, (s.hat === 'capBack' ? -1 : 1) * (hr + 0.04), 0);
+    }
+    var sc = (s.scale || 1) * 1.45;
+    g.scale.setScalar(sc);
+    g.userData.inner = inner;
+    return g;
+  }
+
+  var baggy = makeFigure({ legH: 0.17, legW: 0.075, torsoW: 0.16, torsoH: 0.17, armL: 0.16, headR: 0.062, skin: SKIN[1], pants: P.tan, shirt: P.slate, hat: 'bucket', hatCol: P.cream, board: 0xB9825A });
+  var shortie = makeFigure({ legH: 0.12, legW: 0.05, torsoW: 0.11, torsoH: 0.12, armL: 0.12, headR: 0.058, skin: SKIN[2], pants: P.deepTeal, shirt: P.terracotta, hat: 'capBack', hatCol: P.ink, board: P.teal, scale: 0.85 });
+  var pro = makeFigure({ legH: 0.1, legW: 0.052, torsoW: 0.12, torsoH: 0.14, armL: 0.14, headR: 0.06, skin: SKIN[3], pants: P.ink, shirt: P.cream, hat: 'capFwd', hatCol: P.brick, board: P.brick, lean: 0.5 });
+  var lanky = makeFigure({ legH: 0.25, legW: 0.045, torsoW: 0.095, torsoH: 0.16, armL: 0.2, headR: 0.055, skin: SKIN[0], pants: P.slate, shirt: P.terracotta, hat: 'beanie', hatCol: P.deepTeal, board: 0xB9825A });
+  var filmer = makeFigure({ board: false, legH: 0.2, legW: 0.06, torsoW: 0.13, torsoH: 0.16, armL: 0.14, headR: 0.058, skin: SKIN[1], pants: P.ink, shirt: P.deepTeal, hat: 'capFwd', hatCol: P.cream, armsForward: true });
+
+  // travel direction: local +x -> world. rotation.y = atan2(-dz, dx)
+  function face(fig, dx, dz) { fig.rotation.y = Math.atan2(-dz, dx); }
+  // the far streets sit behind the tall buildings from this camera, so the
+  // skaters stand on the two near streets where they can be seen
+  baggy.position.set(5, 0.12, -1.0);   face(baggy, 0, 1);
+  shortie.position.set(3, 0.12, 5);    face(shortie, -1, 0);
+  pro.position.set(5, 0.12, 2.4);      face(pro, 0, -1);
+  scene.add(baggy, shortie, pro, lanky, filmer);
+
+  // filmer on the sidewalk, camcorder with a blinking LED
+  filmer.position.set(-0.55, 0.14, 4.34);
+  filmer.rotation.y = -Math.PI / 2 + 0.15;     // looks along +z towards the ramp
+  var cam = new THREE.Group();
+  box(cam, 0.07, 0.06, 0.12, P.ink, 0, 0, 0, 0);
+  cyl(cam, 0.025, 0.025, 0.05, 8, P.ink, 0, 0, 0.08, 0).rotation.x = Math.PI / 2;
+  var led = new THREE.Mesh(new THREE.SphereGeometry(0.014, 6, 5), new THREE.MeshBasicMaterial({ color: 0xE02424 }));
+  led.position.set(0.02, 0.04, -0.02); cam.add(led);
+  cam.position.set(0, 0.24, 0.12);
+  // the filmer's local frame is rotated; attach to the torso-level group instead
+  filmer.userData.inner.add(cam);
+  cam.position.set(0.0, 0.34, 0.07);
+  cam.rotation.y = Math.PI / 2;
+
+  // ------------------------------------------------------------------------
+  // the ramp, its flag, and the "filmed trick" loop
+  // ------------------------------------------------------------------------
+  var RAMP_L = 0.9, RAMP_H = 0.42, RAMP_W = 0.78;
+  var rampPivot = new THREE.Group();
+  rampPivot.position.set(-1.0, 0.12, 5.0);
+  rampPivot.rotation.y = Math.PI;                 // local +x travels towards world -x
+  scene.add(rampPivot);
+
+  (function buildRamp() {
+    var sh = new THREE.Shape();
+    sh.moveTo(0, 0);
+    for (var i = 1; i <= 16; i++) {
+      var t = i / 16 * Math.PI / 2;
+      sh.lineTo(RAMP_L * Math.sin(t), RAMP_H * (1 - Math.cos(t)));
+    }
+    sh.lineTo(RAMP_L, 0);
+    sh.lineTo(0, 0);
+    var geo = new THREE.ExtrudeGeometry(sh, { depth: RAMP_W, bevelEnabled: false });
+    geo.translate(-RAMP_L / 2, 0, -RAMP_W / 2);
+    var m = place(new THREE.Mesh(geo, M(0xB9825A)), rampPivot, 0, 0, 0, 0.02);
+    var cop = cyl(rampPivot, 0.026, 0.026, RAMP_W + 0.04, 10, 0x8c9099, RAMP_L / 2, RAMP_H, 0, 0);
+    cop.rotation.x = Math.PI / 2;
+    // mustard flag: the only place the accent appears
+    // (outer edge of the tile, so the camera can see it past the ramp)
+    cyl(rampPivot, 0.016, 0.016, 0.9, 6, P.ink, 0.1, 0.45, -(RAMP_W / 2 + 0.1), 0);
+    box(rampPivot, 0.34, 0.2, 0.016, P.mustard, 0.27, 0.8, -(RAMP_W / 2 + 0.1), 0.012);
+  })();
+
+  var CYCLE = 6.0;
+  function clamp01(x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
+  function easeOutBack(x) { var c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); }
+  function easeOut(x) { return 1 - (1 - x) * (1 - x); }
+  function easeIn(x) { return x * x; }
+
+  var flashEl = document.getElementById('flash');
+  var stampEl = document.getElementById('stamp');
+
+  function setRamp(p) {
+    var sx = 1, sy = 1;
+    if (p < 0.12) {
+      var u = clamp01(p / 0.12);
+      sy = Math.max(0.001, easeOutBack(u));
+      sx = 0.55 + 0.45 * easeOut(u);
+    } else if (p > 0.92) {
+      var v = clamp01((p - 0.92) / 0.08);
+      sy = Math.max(0.001, 1 - easeIn(v));
+      sx = sy;
+    }
+    rampPivot.scale.set(sx, sy, sx);
+    rampPivot.visible = !(p > 0.995);
+  }
+
+  function setRider(p) {
+    var t = p * CYCLE;
+    if (t < 0.9 || t > 4.5) { lanky.visible = false; return; }
+    lanky.visible = true;
+    var x, y, pitch = 0;
+    if (t < 2.4) {
+      var a = (t - 0.9) / 1.5;
+      x = -2.7 + (2.7 - RAMP_L / 2) * (a * (2 - a) * 0.35 + a * 0.65);   // rolls in, easing a touch
+      y = 0;
+    } else if (t < 2.9) {
+      var th = (t - 2.4) / 0.5 * Math.PI / 2;
+      x = -RAMP_L / 2 + RAMP_L * Math.sin(th);
+      y = RAMP_H * (1 - Math.cos(th));
+      pitch = Math.min(1.05, Math.atan2(RAMP_H * Math.sin(th), RAMP_L * Math.cos(th) + 1e-4));
+    } else if (t < 3.9) {
+      var u = (t - 2.9) / 1.0;
+      x = RAMP_L / 2 + 1.9 * u;
+      y = RAMP_H * (1 - u) + 0.62 * 4 * u * (1 - u);
+      pitch = Math.max(-0.35, 1.0 - 1.7 * u);
+      if (u > 0.9) pitch *= (1 - u) / 0.1;
+    } else {
+      x = RAMP_L / 2 + 1.9 + (t - 3.9) * 1.6;
+      y = 0;
+    }
+    // ramp frame -> world (ramp faces world -x)
+    lanky.position.set(rampPivot.position.x - x, rampPivot.position.y + y, rampPivot.position.z);
+    lanky.rotation.y = Math.PI;
+    lanky.userData.inner.rotation.z = pitch;
+  }
+
+  function setFlash(p) {
+    var t = p * CYCLE, f = 0;
+    if (t > 3.6 && t < 3.85) f = 1 - (t - 3.6) / 0.25;
+    flashEl.style.opacity = (f * f * 0.85).toFixed(3);
+  }
+  function setStamp(p) {
+    var o = 0;
+    if (p >= 0.72 && p <= 0.92) {
+      var u = (p - 0.72) / 0.2;
+      o = u < 0.2 ? u / 0.2 : (u > 0.8 ? (1 - u) / 0.2 : 1);
+    }
+    stampEl.style.opacity = o.toFixed(3);
+    stampEl.style.transform = 'translate(-50%, 0) rotate(-6deg) scale(' + (0.9 + 0.1 * Math.min(1, o * 1.4)).toFixed(3) + ')';
+  }
+
+  // ------------------------------------------------------------------------
+  // input and ui
+  // ------------------------------------------------------------------------
+  var dragging = false, lastX = 0;
+  stage.addEventListener('pointerdown', function (e) { dragging = true; lastX = e.clientX; stage.setPointerCapture(e.pointerId); });
+  stage.addEventListener('pointerup', function () { dragging = false; });
+  stage.addEventListener('pointercancel', function () { dragging = false; });
+  stage.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    az -= (e.clientX - lastX) * 0.008; lastX = e.clientX;
+    placeCamera();
+  });
+  stage.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    zoom = Math.min(2.6, Math.max(0.7, zoom * Math.exp(-e.deltaY * 0.0012)));
+    placeCamera();
+  }, { passive: false });
+
+  document.getElementById('chkOutline').addEventListener('change', function (e) {
+    outlines.forEach(function (o) { o.visible = e.target.checked; });
+  });
+  document.getElementById('chkSquint').addEventListener('change', function (e) {
+    renderer.domElement.style.filter = e.target.checked ? 'blur(6px)' : 'none';
+  });
+
+  // ------------------------------------------------------------------------
+  // go
+  // ------------------------------------------------------------------------
+  resize();
+  var t0 = performance.now();
+  // optional: index.html?t=3.4 freezes the loop at that second, for checking one moment of the trick
+  var frozen = parseFloat(new URLSearchParams(location.search).get('t'));
+  function frame(now) {
+    var t = isFinite(frozen) ? frozen : (now - t0) / 1000;
+    var p = (t % CYCLE) / CYCLE;
+    setRamp(p); setRider(p); setFlash(p); setStamp(p);
+    led.visible = Math.floor(t * 2) % 2 === 0;
+    renderer.render(scene, camera);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
