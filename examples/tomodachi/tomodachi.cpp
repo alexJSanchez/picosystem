@@ -12,6 +12,7 @@
 // Runs at the native 240x240 resolution.
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -24,10 +25,11 @@
 
 using namespace picosystem;
 
-enum screen_t { ROOM, FEED, RUN, CREATE, TOWN, MEET };
+enum screen_t { ROOM, FEED, RUN, CREATE, TOWN, MEET, HUB, TRICK, JUMP };
 screen_t scr = ROOM;
 
 void run_start();
+void hub_enter(screen_t from);
 void meet_start();
 
 // ---------------------------------------------------------------------------
@@ -103,6 +105,9 @@ struct pal_t {
   int32_t mood;     // 0..100
   int32_t coins;
   int32_t hearts;   // crew hearts
+  int32_t best_trick;   // best trick attack score
+  int32_t best_height;  // best sky pop height, in tenths of a foot
+  int32_t best_run;     // best street run score
   bool    sleeping;
 } pal;
 
@@ -276,7 +281,7 @@ void draw_msg(int32_t y) {
 
 int32_t room_sel = 0;     // 0..4
 constexpr int32_t N_ACT = 5;
-const char *ACT_NAME[N_ACT] = {"FEED", "SKATE", "DECK", "SLEEP", "SHOP"};
+const char *ACT_NAME[N_ACT] = {"FEED", "SKATE", "DECK", "SLEEP", "PARK"};
 
 void draw_icon(int32_t i, int32_t cx, int32_t cy, uint16_t col) {
   P(col);
@@ -294,8 +299,8 @@ void draw_icon(int32_t i, int32_t cx, int32_t cy, uint16_t col) {
     case 3:  // Z
       hline(cx - 4, cy - 5, 9); line(cx + 4, cy - 5, cx - 4, cy + 5); hline(cx - 4, cy + 5, 9);
       break;
-    case 4:  // coin
-      fcircle(cx, cy, 6); P(0xA70); circle(cx, cy, 4);
+    case 4:  // flag
+      frect(cx - 6, cy - 8, 2, 16); fpoly({cx - 4, cy - 8, cx + 8, cy - 5, cx - 4, cy - 2});
       break;
   }
 }
@@ -373,18 +378,11 @@ void update_room() {
     switch(room_sel) {
       case 0: scr = FEED; blip(700); break;
       case 1:
-        if(pal.energy < 15)       { say("TOO TIRED TO SKATE"); thud(); }
-        else if(pal.hunger < 10)  { say("TOO HUNGRY TO SKATE"); thud(); }
-        else { scr = RUN; blip(900); run_start(); }
+        hub_enter(ROOM); blip(900);
         break;
       case 2: scr = CREATE; blip(700); break;
       case 3: pal.sleeping = true; blip(300, 120); break;
-      case 4:
-        if(pal.coins >= 15) {
-          pal.coins -= 15; pal.mood = clampi(pal.mood + 15, 0, 100);
-          say("FRESH GRIP TAPE! +MOOD"); jingle(880);
-        } else { say("NEED 15 COINS"); thud(); }
-        break;
+      case 4: scr = TOWN; blip(700); break;
     }
   }
 }
@@ -532,7 +530,7 @@ void hit_player() {
 void update_run() {
   if(rs == R_READY) {
     if(pressed(A)) { rs = R_PLAY; blip(900); }
-    if(pressed(Y) || pressed(B)) { scr = ROOM; }
+    if(pressed(Y) || pressed(B)) { scr = HUB; }
     return;
   }
 
@@ -541,12 +539,13 @@ void update_run() {
       r_rewarded = true;
       int32_t earned = r_score / 40;
       pal.coins += earned;
+      if(r_score > pal.best_run) pal.best_run = r_score;
       pal.mood   = clampi(pal.mood + 10 + earned / 4, 0, 100);
       pal.energy = clampi(pal.energy - 15, 0, 100);
       pal.hunger = clampi(pal.hunger - 10, 0, 100);
       jingle(990);
     }
-    if(pressed(A) || pressed(B)) { scr = ROOM; }
+    if(pressed(A) || pressed(B)) { scr = HUB; }
     return;
   }
 
@@ -824,10 +823,7 @@ void update_town() {
     if(kai_wants && near_kai()) { scr = MEET; meet_start(); blip(900); return; }
     int32_t s = near_spot();
     if(s == 4) {
-      if(pal.coins >= 15) {
-        pal.coins -= 15; pal.mood = clampi(pal.mood + 15, 0, 100);
-        say("NEW GRIP TAPE! +MOOD"); jingle(880);
-      } else { say("NEED 15 COINS"); thud(); }
+      hub_enter(TOWN); blip(900); return;
     } else if(s >= 0) {
       if(pal.energy < 10) { say("TOO TIRED"); thud(); }
       else {
@@ -1004,6 +1000,582 @@ void draw_meet() {
 }
 
 // ---------------------------------------------------------------------------
+// SKATE SHOP hub, TRICK ATTACK (half-pipe) and SKY POP (high jump)
+// ---------------------------------------------------------------------------
+
+enum ev_state_t { EV_READY, EV_PLAY, EV_OVER };
+
+// "6'2\"" from tenths of a foot (62 -> 6'2")
+std::string fmt_h(int32_t tenths) {
+  return str(tenths / 10) + "'" + str(((tenths % 10) * 12) / 10) + "\"";
+}
+
+// coins, mood and tiredness after finishing an event
+void event_done(int32_t coins) {
+  pal.coins += coins;
+  pal.mood   = clampi(pal.mood + 10 + coins / 4, 0, 100);
+  pal.energy = clampi(pal.energy - 12, 0, 100);
+  pal.hunger = clampi(pal.hunger - 8, 0, 100);
+  jingle(990);
+}
+
+// ---- the half-pipe stage shared by the two ramp events --------------------
+
+int32_t bowl_y[SCREEN_WIDTH];            // riding surface for every screen column
+
+void bowl_init() {
+  for(int32_t x = 0; x < SCREEN_WIDTH; x++) {
+    float d = std::fabs((x - 120) / 112.0f);
+    if(d > 1.0f) d = 1.0f;
+    bowl_y[x] = 196 - (int32_t)(92.0f * d * d * std::sqrt(d));    // d^2.5
+  }
+}
+
+void draw_stage() {
+  // sky
+  P(0x57C); frect(0, 22, SCREEN_WIDTH, 24);
+  P(0x79E); frect(0, 46, SCREEN_WIDTH, 16);
+  P(0x9BF); frect(0, 62, SCREEN_WIDTH, 14);
+
+  // banner flags
+  static const uint16_t FLAG[6] = {0xE34, 0xFD4, 0x4B5, 0xF6A, 0xF83, 0x3CB};
+  for(int32_t i = 0; i < 6; i++) {
+    int32_t x = 8 + i * 40;
+    P(0x112); vline(x, 62, 12);
+    P(FLAG[i]); fpoly({x + 1, 62, x + 14, 65, x + 1, 68});
+  }
+
+  // the crowd: a speckle of heads and shirts, a few of them bouncing
+  static const uint16_t CROWD[8] = {0xE34, 0xFD4, 0x36E, 0x3C5, 0xF6A, 0xF83, 0x3CB, 0xFFF};
+  P(0x224); frect(0, 76, SCREEN_WIDTH, 30);
+  uint32_t seed = 7;
+  for(int32_t y = 79; y < 102; y += 5) {
+    for(int32_t x = 0; x < SCREEN_WIDTH; x += 4) {
+      seed = seed * 1664525u + 1013904223u;
+      int32_t bounce = (((now_f / 12) + (seed >> 28)) % 5 == 0) ? 1 : 0;
+      P((seed & 4) ? 0xFC9 : 0xD96); frect(x + 1, y - bounce, 2, 2);
+      P(CROWD[(seed >> 8) & 7]);     frect(x, y + 2 - bounce, 4, 3);
+    }
+  }
+  P(0x112); frect(0, 104, SCREEN_WIDTH, 2);
+
+  // the bowl: dark under the lip, lit riding surface
+  P(0x338); frect(0, 106, SCREEN_WIDTH, 118);
+  for(int32_t x = 0; x < SCREEN_WIDTH; x++) {
+    int32_t y = bowl_y[x];
+    P(((x / 24) % 2) ? 0x99B : 0xAAC); vline(x, y, 224 - y);
+    P(0x112);                          vline(x, y - 1, 1);
+  }
+  // platforms with rails on both lips
+  for(int32_t s = 0; s < 2; s++) {
+    int32_t x = s ? 218 : 0;
+    P(0x112); frect(x, 96, 22, 12);
+    P(0x669); frect(x, 97, 22, 10);
+    P(0xAAC); frect(x, 97, 22, 2);
+    P(0x112); frect(x + 5, 86, 2, 11); frect(x + 15, 86, 2, 11);
+    P(0xAAC); frect(x + 3, 85, 15, 2);
+  }
+}
+
+// ---- TRICK ATTACK ---------------------------------------------------------
+
+constexpr int32_t T_AIRS = 5, T_AIR_LEN = 64, T_TRICK_LEN = 16;
+const char *TRICK_NAME[3] = {"GRAB", "KICKFLIP!", "360 SPIN!"};
+const int32_t TRICK_PTS[3] = {100, 150, 200};
+
+ev_state_t ts = EV_READY;
+float t_phase, t_amp;
+int32_t t_air, t_airs, t_score, t_combo, t_sum, t_ntricks;
+int32_t t_trick, t_trick_t, t_last_done, t_pump_cd, t_side, t_lastk, t_banner_t;
+bool t_rewarded;
+std::string t_banner;
+
+void t_say(const std::string &s) { t_banner = s; t_banner_t = 50; }
+
+void trick_start() {
+  ts = EV_READY;
+  t_phase = 0; t_amp = 0.5f;
+  t_air = -1; t_airs = 0; t_score = 0; t_combo = 0; t_sum = 0; t_ntricks = 0;
+  t_trick = -1; t_trick_t = 0; t_last_done = -1; t_pump_cd = 0; t_side = 1;
+  t_lastk = -1; t_banner_t = 0; t_rewarded = false;
+}
+
+void update_trick() {
+  if(ts == EV_READY) {
+    if(pressed(A)) { ts = EV_PLAY; blip(900); }
+    if(pressed(B)) scr = HUB;
+    return;
+  }
+  if(ts == EV_OVER) {
+    if(!t_rewarded) {
+      t_rewarded = true;
+      event_done(t_score / 60);
+      if(t_score > pal.best_trick) pal.best_trick = t_score;
+    }
+    if(pressed(A) || pressed(B)) scr = HUB;
+    return;
+  }
+
+  if(t_banner_t > 0) t_banner_t--;
+  if(t_pump_cd > 0) t_pump_cd--;
+
+  if(t_air < 0) {
+    // riding the transition back and forth
+    t_phase += 6.2831853f / 72.0f;
+    float s = std::sin(t_phase);
+    float x = t_amp * s;
+
+    // pump through the middle of the bowl to build speed
+    if(pressed(A) && std::fabs(x) < 0.45f && t_pump_cd == 0) {
+      t_amp = std::min(1.0f, t_amp + 0.14f);
+      t_pump_cd = 8;
+      blip(500 + (int32_t)(t_amp * 400), 30);
+    }
+
+    // crossing the top of the swing at full speed means air
+    int32_t k = (int32_t)std::floor((t_phase - 1.5707963f) / 3.1415927f);
+    if(k != t_lastk) {
+      t_lastk = k;
+      if(t_amp >= 0.995f) {
+        t_air = 0;
+        t_side = (s > 0) ? 1 : -1;
+        t_sum = 0; t_ntricks = 0; t_trick = -1; t_trick_t = 0; t_last_done = -1;
+        blip(800, 60);
+      }
+    }
+    return;
+  }
+
+  // in the air
+  t_air++;
+  if(t_trick_t > 0) {
+    if(--t_trick_t == 0) {
+      int32_t pts = TRICK_PTS[t_trick];
+      if(t_trick == t_last_done) pts /= 2;     // repeating a trick is worth less
+      t_sum += pts; t_ntricks++; t_last_done = t_trick;
+      jingle(700 + t_ntricks * 150);
+    }
+  } else if(t_air < T_AIR_LEN - 6) {
+    int32_t k = pressed(B) ? 0 : pressed(X) ? 1 : pressed(Y) ? 2 : -1;
+    if(k >= 0) { t_trick = k; t_trick_t = T_TRICK_LEN; t_say(TRICK_NAME[k]); }
+  }
+
+  if(t_air >= T_AIR_LEN) {
+    if(t_trick_t > 0) {                        // still mid trick: bail
+      t_combo = 0; t_amp = 0.5f;
+      t_say("BAIL!"); thud();
+    } else if(t_ntricks > 0) {                 // clean landing
+      int32_t pts = t_sum * (1 + t_combo);
+      t_score += pts; t_combo++;
+      t_say("+" + str(pts)); jingle(990);
+    } else {
+      t_combo = 0; t_say("NO TRICK");
+    }
+    t_trick_t = 0; t_air = -1;
+    if(++t_airs >= T_AIRS) ts = EV_OVER;
+  }
+}
+
+void draw_trick() {
+  draw_stage();
+
+  // pip
+  int32_t px, by, emo = 0, fl = 0;
+  if(t_air < 0) {
+    px = 120 + (int32_t)(t_amp * std::sin(t_phase) * 112.0f);
+    by = bowl_y[clampi(px, 0, SCREEN_WIDTH - 1)];
+  } else {
+    float u = (float)t_air / T_AIR_LEN;
+    px = 120 + t_side * (112 + (int32_t)(5.0f * std::sin(3.1415927f * u)));
+    by = bowl_y[clampi(px, 0, SCREEN_WIDTH - 1)] - (int32_t)(4.0f * 46.0f * u * (1.0f - u));
+    if(t_trick_t > 0) { emo = 1; if(t_trick == 1) fl = t_trick_t; }
+  }
+  P(0x112, 8); fellipse(px, bowl_y[clampi(px, 0, SCREEN_WIDTH - 1)] + 1, 12, 3);
+  draw_pip(pal.look, px, by, 2, emo, fl);
+
+  if(t_banner_t > 0) TC(t_banner, 120, 30 - (50 - t_banner_t) / 8, 0xFD4, true);
+
+  top_bar("PIP", false);
+  TC("AIR " + str(std::min<int32_t>(t_airs + 1, T_AIRS)) + "/" + str(T_AIRS), 120, 4, 0xFFF);
+  T(str(t_score), 236 - 6 * (int32_t)str(t_score).size(), 4, 0xFFF);
+
+  P(0x214); frect(0, 224, SCREEN_WIDTH, 16);
+  P(0x112); hline(0, 224, SCREEN_WIDTH);
+  T("COMBO", 6, 228, 0xFD4);
+  bar(52, 229, 120, clampi(t_combo * 25, 0, 100), 0xFC3);
+  T("X" + str(1 + t_combo), 184, 228, 0xFFF);
+  // button hints sit on the stage so the combo bar stays readable
+  P(0x112, 9); frect(0, 108, 240, 12);
+  TC(t_air >= 0 ? "B:GRAB  X:FLIP  Y:SPIN" : "PUMP THE MIDDLE WITH A", 120, 110, 0xFFF);
+
+  if(ts == EV_READY) {
+    P(0x112, 12); frect(24, 124, 192, 70); P(0xFFF); rect(24, 124, 192, 70);
+    TC("TRICK ATTACK", 120, 132, 0xFD4);
+    TC("PUMP WITH A TO GO HIGH", 120, 148, 0xFFF);
+    TC("CHAIN TRICKS IN THE AIR", 120, 158, 0xFFF);
+    TC("A TO START", 120, 176, 0xFD4);
+  } else if(ts == EV_OVER) {
+    P(0x112, 12); frect(24, 122, 192, 78); P(0xFFF); rect(24, 122, 192, 78);
+    TC("RUN OVER!", 120, 130, 0xFD4);
+    TC("SCORE " + str(t_score), 120, 146, 0xFFF);
+    TC("COINS +" + str(t_score / 60), 120, 158, 0xFC3);
+    if(t_score >= pal.best_trick && t_score > 0) TC("NEW BEST!", 120, 170, 0xF6A);
+    TC("A TO CONTINUE", 120, 184, 0xFD4);
+  }
+}
+
+// ---- SKY POP ---------------------------------------------------------------
+
+enum j_state_t { J_MASH, J_FLY, J_RESULT };
+ev_state_t js = EV_READY;
+j_state_t jst = J_MASH;
+int32_t j_pass, j_t, j_h, j_cleared, j_best, j_px0, j_y0, j_banner_t;
+float j_meter;
+bool j_clear, j_rewarded;
+std::string j_banner;
+
+int32_t j_bar() { return 45 + 6 * j_pass; }      // bar height in tenths of a foot
+int32_t bar_y(int32_t tenths) { return 100 - (tenths * 9) / 10; }
+
+void jump_start() {
+  js = EV_READY; jst = J_MASH;
+  j_pass = 0; j_t = 0; j_h = 0; j_cleared = 0; j_best = 0; j_meter = 0;
+  j_clear = false; j_rewarded = false; j_banner_t = 0;
+}
+
+void update_jump() {
+  if(js == EV_READY) {
+    if(pressed(A)) { js = EV_PLAY; blip(900); }
+    if(pressed(B)) scr = HUB;
+    return;
+  }
+  if(js == EV_OVER) {
+    if(!j_rewarded) {
+      j_rewarded = true;
+      event_done(j_cleared * 5);
+      if(j_best > pal.best_height) pal.best_height = j_best;
+    }
+    if(pressed(A) || pressed(B)) scr = HUB;
+    return;
+  }
+
+  if(j_banner_t > 0) j_banner_t--;
+  j_t++;
+
+  if(jst == J_MASH) {
+    if(pressed(A)) { j_meter = std::min(100.0f, j_meter + 7.0f); blip(400 + (int32_t)(j_meter * 6), 20); }
+    j_meter = std::max(0.0f, j_meter - 0.35f);
+    if(pressed(B) || j_t > 280) {
+      // pop! height comes from how much speed was built, with a bonus for the red zone
+      j_h = 30 + (int32_t)(j_meter * 0.42f);
+      if(j_meter >= 88.0f) j_h += 4;
+      j_clear = j_h >= j_bar();
+      float x = 120 + std::sin(now_f * 0.22f) * (j_meter / 100.0f) * 95.0f;
+      j_px0 = (int32_t)x;
+      j_y0 = bowl_y[clampi(j_px0, 0, SCREEN_WIDTH - 1)];
+      jst = J_FLY; j_t = 0;
+      blip(900, 80);
+    }
+  } else if(jst == J_FLY) {
+    if(j_t >= 50) {
+      if(j_clear) {
+        j_cleared++; if(j_h > j_best) j_best = j_h;
+        j_banner = "CLEARED " + fmt_h(j_h); jingle(1100);
+      } else {
+        j_banner = "CLIPPED THE BAR!"; thud();
+      }
+      j_banner_t = 55;
+      jst = J_RESULT; j_t = 0;
+    }
+  } else {
+    if(j_t >= 60) {
+      if(++j_pass >= 5) js = EV_OVER;
+      else { jst = J_MASH; j_t = 0; j_meter = 0; }
+    }
+  }
+}
+
+void draw_jump() {
+  draw_stage();
+
+  // measuring pole on the right with the bar across it
+  int32_t by_ = bar_y(j_bar());
+  P(0x112); frect(205, 22, 7, 88);
+  P(0xFD4); frect(206, 22, 5, 86);
+  P(0x112); for(int32_t f = 1; f <= 8; f++) frect(206, 100 - f * 9, 5, 1);
+  bool hit = (jst == J_RESULT && !j_clear);
+  P(0x112); frect(194, by_ - 1, 24, 5);
+  P(hit ? 0xA77 : 0xE34); frect(hit ? 190 : 195, hit ? by_ + 20 : by_, 22, 3);
+
+  // pip
+  int32_t px, by, emo = 0;
+  if(jst == J_MASH) {
+    float x = 120 + std::sin(now_f * 0.22f) * (j_meter / 100.0f) * 95.0f;
+    px = (int32_t)x;
+    by = bowl_y[clampi(px, 0, SCREEN_WIDTH - 1)];
+  } else {
+    int32_t t = (jst == J_FLY) ? j_t : 50;
+    float u = t / 50.0f;
+    int32_t apex = (j_h * 9) / 10 + 4;
+    px = j_px0 + (int32_t)((196 - j_px0) * u);
+    int32_t base = j_y0 + (int32_t)((104 - j_y0) * u);
+    by = base - (int32_t)(4.0f * apex * u * (1.0f - u));
+    if(jst == J_RESULT) { by = 104; px = 196; }
+    emo = j_clear ? 1 : -1;
+  }
+  P(0x112, 8); fellipse(px, bowl_y[clampi(px, 0, SCREEN_WIDTH - 1)] + 1, 12, 3);
+  draw_pip(pal.look, px, by, 2, emo);
+
+  if(j_banner_t > 0) TC(j_banner, 100, 36, j_clear ? 0xFD4 : 0xF66, true);
+
+  top_bar("PIP", false);
+  TC("PASS " + str(std::min<int32_t>(j_pass + 1, 5)) + "/5", 120, 4, 0xFFF);
+  T("BAR " + fmt_h(j_bar()), 150, 4, 0xFD4);
+
+  // speed panel
+  P(0x214); frect(0, 196, SCREEN_WIDTH, 28);
+  P(0x112); hline(0, 196, SCREEN_WIDTH);
+  T("SPEED", 6, 202, 0xFD4);
+  P(0x112); frect(56, 200, 176, 12);
+  P(0x213); frect(58, 202, 172, 8);
+  for(int32_t i = 0; i < 20; i++) {
+    if(i * 5 < (int32_t)j_meter) { P(i < 10 ? 0x4B5 : (i < 17 ? 0xFD4 : 0xE34)); frect(58 + i * 8 + 1, 202, 6, 8); }
+  }
+  P(0xFFF); frect(58 + (88 * 172) / 100, 198, 1, 14);   // the red zone starts here
+  T("A:MASH", 6, 214, 0xFFF);
+  T("B:POP IN THE RED", 234 - 6 * 16, 214, 0xFD4);
+
+  P(0x214); frect(0, 224, SCREEN_WIDTH, 16);
+  P(0x112); hline(0, 224, SCREEN_WIDTH);
+  T("BEST " + fmt_h(std::max<int32_t>(j_best, pal.best_height)), 6, 228, 0xFFF);
+  T("CLEARED " + str(j_cleared), 150, 228, 0xFC3);
+
+  if(js == EV_READY) {
+    P(0x112, 12); frect(24, 110, 192, 78); P(0xFFF); rect(24, 110, 192, 78);
+    TC("SKY POP", 120, 118, 0xFD4);
+    TC("MASH A TO BUILD SPEED", 120, 134, 0xFFF);
+    TC("B TO POP IN THE RED ZONE", 120, 144, 0xFFF);
+    TC("CLEAR THE BAR 5 TIMES", 120, 154, 0xFFF);
+    TC("A TO START", 120, 172, 0xFD4);
+  } else if(js == EV_OVER) {
+    P(0x112, 12); frect(24, 110, 192, 78); P(0xFFF); rect(24, 110, 192, 78);
+    TC("ALL DONE!", 120, 118, 0xFD4);
+    TC("BEST " + fmt_h(j_best), 120, 134, 0xFFF);
+    TC("COINS +" + str(j_cleared * 5), 120, 146, 0xFC3);
+    if(j_best >= pal.best_height && j_best > 0) TC("NEW BEST!", 120, 158, 0xF6A);
+    TC("A TO CONTINUE", 120, 174, 0xFD4);
+  }
+}
+
+// ---- HUB: the skate shop ---------------------------------------------------
+
+constexpr int32_t N_HUB = 5;
+const char *HUB_NAME[N_HUB]  = {"TRICK", "JUMP", "RUN", "BUY", "SCORE"};
+const char *HUB_LONG[N_HUB]  = {"TRICK ATTACK", "SKY POP", "STREET RUN", "GRIP TAPE 15c", "BEST SCORES"};
+int32_t hub_sel = 0;
+screen_t hub_from = ROOM;
+bool hub_scores = false;
+int32_t hub_tip = 0;
+std::string hub_l[3];            // what coach roxy is saying right now
+int32_t hub_say_t = 0;
+
+const char *TIPS[4][3] = {
+  {"YO PIP!", "PICK AN EVENT", "AND SEND IT!"},
+  {"MASH A FOR SPEED,", "THEN POP IN THE", "RED ZONE!"},
+  {"CHAIN TRICKS FOR", "A BIG COMBO. DON'T", "BAIL!"},
+  {"COINS BUY GRIP", "TAPE. FRESH GRIP", "= GOOD VIBES."},
+};
+
+void hub_say(const char *a, const char *b, const char *c) {
+  hub_l[0] = a; hub_l[1] = b; hub_l[2] = c;
+  hub_say_t = 110;
+}
+
+void hub_enter(screen_t from) {
+  scr = HUB; hub_from = from; hub_scores = false; hub_say_t = 0;
+  hub_tip = std::rand() % 4;
+}
+
+bool hub_can_skate() {
+  if(pal.energy < 15) { hub_say("YOU LOOK BEAT,", "PIP. GO TAKE", "A NAP FIRST!"); thud(); return false; }
+  if(pal.hunger < 10) { hub_say("STOMACH GROWLING?", "GO GET A SNACK", "FIRST!"); thud(); return false; }
+  return true;
+}
+
+void update_hub() {
+  if(hub_say_t > 0) hub_say_t--;
+  if(hub_scores) {
+    if(pressed(A) || pressed(B)) { hub_scores = false; blip(400); }
+    return;
+  }
+  if(pressed(LEFT))  { hub_sel = wrapi(hub_sel - 1, N_HUB); blip(500, 30); }
+  if(pressed(RIGHT)) { hub_sel = wrapi(hub_sel + 1, N_HUB); blip(500, 30); }
+  if(pressed(B))     { scr = hub_from; blip(400); return; }
+  if(!pressed(A)) return;
+
+  switch(hub_sel) {
+    case 0: if(hub_can_skate()) { scr = TRICK; trick_start(); blip(900); } break;
+    case 1: if(hub_can_skate()) { scr = JUMP;  jump_start();  blip(900); } break;
+    case 2: if(hub_can_skate()) { scr = RUN;   run_start();   blip(900); } break;
+    case 3:
+      if(pal.coins >= 15) {
+        pal.coins -= 15; pal.mood = clampi(pal.mood + 15, 0, 100);
+        hub_say("FRESH GRIP TAPE!", "THAT'LL CHEER", "PIP UP. +MOOD"); jingle(880);
+      } else { hub_say("COME BACK WITH", "15 COINS, KID.", ""); thud(); }
+      break;
+    case 4: hub_scores = true; blip(700); break;
+  }
+}
+
+// coach roxy: spiky orange hair, goggles, denim vest
+void draw_roxy(int32_t cx, int32_t cy) {
+  clip(130, 22, 110, 140);
+  // vest over a tee
+  P(0x112); fpoly({cx - 44, cy + 70, cx - 34, cy + 34, cx + 34, cy + 34, cx + 44, cy + 70});
+  P(0x37B); fpoly({cx - 42, cy + 70, cx - 32, cy + 36, cx + 32, cy + 36, cx + 42, cy + 70});
+  P(0xFFF); fpoly({cx - 12, cy + 36, cx + 12, cy + 36, cx, cy + 60});
+  P(0xF6A); frect(cx - 30, cy + 48, 10, 8);
+  P(0xFD4); frect(cx + 22, cy + 52, 10, 8);
+  P(0xD96); frect(cx - 9, cy + 22, 18, 16);
+
+  // spiky hair behind the head
+  P(0x112);
+  fpoly({cx - 27, cy - 4, cx - 34, cy - 30, cx - 20, cy - 20, cx - 16, cy - 48, cx - 6, cy - 26,
+         cx + 2, cy - 52, cx + 8, cy - 26, cx + 20, cy - 46, cx + 22, cy - 22, cx + 34, cy - 32, cx + 28, cy - 2});
+  P(0xF83);
+  fpoly({cx - 25, cy - 4, cx - 31, cy - 28, cx - 19, cy - 19, cx - 15, cy - 44, cx - 6, cy - 24,
+         cx + 2, cy - 48, cx + 8, cy - 24, cx + 19, cy - 42, cx + 20, cy - 20, cx + 31, cy - 29, cx + 26, cy - 3});
+
+  // head
+  P(0x112); fellipse(cx, cy, 26, 30);
+  P(0xFC9); fellipse(cx, cy, 24, 28);
+  P(0xF83);
+  fpoly({cx - 24, cy - 10, cx - 22, cy - 22, cx - 8, cy - 28, cx + 8, cy - 28, cx + 22, cy - 22, cx + 24, cy - 10,
+         cx + 12, cy - 16, cx, cy - 18, cx - 12, cy - 16});
+
+  // goggles pushed up on the forehead
+  P(0x112); frect(cx - 26, cy - 17, 52, 4);
+  fellipse(cx - 11, cy - 17, 8, 6); fellipse(cx + 11, cy - 17, 8, 6);
+  P(0x6DF); fellipse(cx - 11, cy - 17, 6, 4); fellipse(cx + 11, cy - 17, 6, 4);
+  P(0xFFF); frect(cx - 13, cy - 19, 3, 1); frect(cx + 9, cy - 19, 3, 1);
+
+  // face
+  for(int32_t s = -1; s <= 1; s += 2) {
+    P(0xFFF); fellipse(cx + s * 9, cy - 2, 5, 4);
+    P(0x112); frect(cx + s * 9 - 1, cy - 3, 3, 3);
+  }
+  P(0x112); frect(cx - 16, cy - 10, 12, 2); frect(cx + 4, cy - 9, 12, 2);
+  P(0xD96); frect(cx - 2, cy + 2, 4, 6);
+  P(0x112); fellipse(cx, cy + 14, 13, 8);
+  P(0xFFF); frect(cx - 12, cy + 9, 24, 4);
+  P(0xF6A); fellipse(cx, cy + 18, 7, 3);
+  P(0xD96); frect(cx - 18, cy + 6, 2, 2); frect(cx + 14, cy + 6, 2, 2); frect(cx - 15, cy + 9, 2, 2);
+  clip();
+}
+
+void hub_icon(int32_t i, int32_t cx, int32_t cy, bool sel) {
+  uint16_t c = sel ? 0xFD4 : 0xCCE;
+  P(c);
+  switch(i) {
+    case 0:  // half-pipe with a trick banner flag
+      fpoly({cx - 14, cy - 12, cx - 9, cy - 12, cx - 8, cy + 4, cx + 8, cy + 4, cx + 9, cy - 12, cx + 14, cy - 12,
+             cx + 12, cy + 8, cx - 12, cy + 8});
+      P(0xE34); frect(cx - 4, cy - 14, 8, 2); frect(cx - 2, cy - 12, 4, 3);
+      break;
+    case 1:  // pole, bar and a jumper
+      frect(cx + 8, cy - 14, 3, 28);
+      P(0xE34); frect(cx + 2, cy - 8, 10, 2);
+      P(c); frect(cx - 10, cy - 2, 5, 4); frect(cx - 9, cy + 2, 3, 6);
+      P(0x3CB); frect(cx - 12, cy + 8, 10, 2);
+      break;
+    case 2:  // cone with speed lines
+      fpoly({cx - 6, cy + 10, cx + 6, cy + 10, cx, cy - 8});
+      P(0xFFF); frect(cx - 3, cy + 1, 6, 2);
+      P(c); hline(cx - 14, cy - 2, 5); hline(cx - 14, cy + 3, 7); hline(cx + 9, cy - 2, 5);
+      break;
+    case 3:  // coin
+      fcircle(cx, cy, 9); P(0xA70); circle(cx, cy, 6); frect(cx - 1, cy - 3, 2, 6);
+      break;
+    default: // trophy
+      frect(cx - 8, cy - 12, 16, 12); frect(cx - 12, cy - 10, 4, 6); frect(cx + 8, cy - 10, 4, 6);
+      frect(cx - 3, cy, 6, 6); frect(cx - 8, cy + 6, 16, 3);
+      P(sel ? 0x426 : 0x214); frect(cx - 4, cy - 10, 3, 6);
+  }
+}
+
+void draw_hub() {
+  // brick wall
+  P(0x346); frect(0, 22, SCREEN_WIDTH, 140);
+  P(0x234);
+  for(int32_t y = 22, row = 0; y < 162; y += 10, row++) {
+    hline(0, y, SCREEN_WIDTH);
+    for(int32_t x = (row % 2) * 12; x < SCREEN_WIDTH; x += 24) vline(x, y, 10);
+  }
+
+  // neon sign
+  P(0x112); frect(6, 28, 112, 22);
+  P(0xF6A); rect(8, 30, 108, 18); rect(9, 31, 106, 16);
+  TC("SKATE SHOP", 62, 36, 0xFDE);
+
+  // decks hung on the wall
+  static const uint16_t DK1[3] = {0xE34, 0x3CB, 0x36E}, DK2[3] = {0xFD4, 0xFFF, 0xF83};
+  for(int32_t i = 0; i < 3; i++) {
+    int32_t x = 190 + i * 16;
+    P(0x112); frect(x - 2, 26, 14, 46); fellipse(x + 5, 26, 7, 5); fellipse(x + 5, 72, 7, 5);
+    P(DK1[i]); frect(x - 1, 26, 12, 46); fellipse(x + 5, 26, 6, 4); fellipse(x + 5, 72, 6, 4);
+    P(DK2[i]); frect(x + 1, 38, 8, 6);
+  }
+
+  // speech bubble
+  P(0x112); fpoly({10, 56, 112, 56, 116, 60, 116, 104, 112, 108, 10, 108, 6, 104, 6, 60});
+  P(0xFFF); fpoly({12, 58, 110, 58, 114, 62, 114, 102, 110, 106, 12, 106, 8, 102, 8, 62});
+  P(0x112); fpoly({114, 72, 142, 90, 114, 86});
+  P(0xFFF); fpoly({113, 74, 136, 89, 113, 84});
+
+  std::string l0, l1, l2;
+  if(hub_say_t > 0)           { l0 = hub_l[0]; l1 = hub_l[1]; l2 = hub_l[2]; }
+  else if(pal.energy < 25)    { l0 = "YOU LOOK BEAT,"; l1 = "PIP. TAKE A"; l2 = "NAP SOON!"; }
+  else if(pal.hunger < 25)    { l0 = "SNACK TIME?"; l1 = "YOU'RE RUNNING"; l2 = "ON EMPTY."; }
+  else                        { l0 = TIPS[hub_tip][0]; l1 = TIPS[hub_tip][1]; l2 = TIPS[hub_tip][2]; }
+  T(l0, 14, 64, 0xE34);
+  T(l1, 14, 77, 0x112);
+  T(l2, 14, 90, 0x112);
+
+  draw_roxy(180, 102);
+
+  // counter, with her hands on it
+  P(0x112); frect(0, 160, SCREEN_WIDTH, 24);
+  P(0x842); frect(0, 162, SCREEN_WIDTH, 20);
+  P(0xDA6); frect(0, 162, SCREEN_WIDTH, 3);
+  P(0xD96); fellipse(150, 160, 12, 5); fellipse(210, 160, 12, 5);
+
+  // event tiles
+  for(int32_t i = 0; i < N_HUB; i++) {
+    int32_t x = 2 + i * 48;
+    bool sel = i == hub_sel;
+    P(sel ? 0xFD4 : 0x112); frect(x, 185, 44, 38);
+    P(sel ? 0x65C : 0x426); frect(x + 2, 187, 40, 34);
+    hub_icon(i, x + 22, 200, sel);
+    TC(HUB_NAME[i], x + 22, 211, sel ? 0xFD4 : 0xFFF);
+  }
+
+  top_bar("SKATE SHOP", false);
+  T(str(pal.coins) + "c", 160, 4, 0xFC3);
+  bottom_bar(HUB_LONG[hub_sel], "B:BACK", "A:GO");
+
+  if(hub_scores) {
+    P(0x112); frect(24, 52, 192, 124);
+    P(0xFFF); rect(24, 52, 192, 124); rect(25, 53, 190, 122);
+    TC("BEST SCORES", 120, 62, 0xFD4);
+    T("TRICK ATTACK", 38, 82, 0xFFF);   T(str(pal.best_trick), 202 - 6 * (int32_t)str(pal.best_trick).size(), 82, 0xFC3);
+    T("SKY POP", 38, 98, 0xFFF);        T(fmt_h(pal.best_height), 202 - 6 * (int32_t)fmt_h(pal.best_height).size(), 98, 0xFC3);
+    T("STREET RUN", 38, 114, 0xFFF);    T(str(pal.best_run), 202 - 6 * (int32_t)str(pal.best_run).size(), 114, 0xFC3);
+    T("CREW LEVEL", 38, 130, 0xFFF);    T(str(level()), 202 - 6 * (int32_t)str(level()).size(), 130, 0xF6A);
+    TC("A: CLOSE", 120, 158, 0xFD4);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // saving: pip lives on in flash between power-offs
 // ---------------------------------------------------------------------------
 //
@@ -1014,15 +1586,25 @@ void draw_meet() {
 // the sector is only erased once per 16 saves. Loading picks the valid slot
 // with the highest sequence number.
 
-constexpr uint32_t SAVE_OFFSET = 1536 * 1024;
-constexpr uint32_t SAVE_MAGIC  = 0x31444D54;      // "TMD1"
-constexpr int32_t  N_SLOTS     = FLASH_SECTOR_SIZE / FLASH_PAGE_SIZE;
+constexpr uint32_t SAVE_OFFSET   = 1536 * 1024;
+constexpr uint32_t SAVE_MAGIC    = 0x32444D54;      // "TMD2"
+constexpr uint32_t SAVE_MAGIC_V1 = 0x31444D54;      // "TMD1": before best scores existed
+constexpr int32_t  N_SLOTS       = FLASH_SECTOR_SIZE / FLASH_PAGE_SIZE;
+
+struct save_v1_t {                                  // old layout, still readable
+  uint32_t magic;
+  uint32_t seq;
+  int32_t  hunger, energy, mood, coins, hearts;
+  int32_t  face, cap, shirt, board, skin;
+  uint32_t crc;
+};
 
 struct save_t {
   uint32_t magic;
   uint32_t seq;
   int32_t  hunger, energy, mood, coins, hearts;
   int32_t  face, cap, shirt, board, skin;
+  int32_t  best_trick, best_height, best_run;
   uint32_t crc;
 };
 
@@ -1031,19 +1613,28 @@ int32_t  save_next = 0;        // next blank slot, N_SLOTS means "erase first"
 save_t   last_saved = {};
 int32_t  saved_flash = 0;      // frames left to show the "saved" dot
 
-const save_t *slot_ptr(int32_t i) {
-  return (const save_t *)(XIP_BASE + SAVE_OFFSET + i * FLASH_PAGE_SIZE);
+const uint8_t *slot_ptr(int32_t i) {
+  return (const uint8_t *)(XIP_BASE + SAVE_OFFSET + i * FLASH_PAGE_SIZE);
 }
 
-uint32_t save_crc(const save_t &s) {
-  const uint8_t *b = (const uint8_t *)&s;
-  uint32_t h = 2166136261u;                       // FNV-1a over everything before crc
-  for(size_t i = 0; i < offsetof(save_t, crc); i++) { h ^= b[i]; h *= 16777619u; }
+// FNV-1a over a run of bytes
+uint32_t crc_bytes(const void *p, size_t n) {
+  const uint8_t *b = (const uint8_t *)p;
+  uint32_t h = 2166136261u;
+  for(size_t i = 0; i < n; i++) { h ^= b[i]; h *= 16777619u; }
   return h;
 }
 
-bool slot_valid(const save_t *s) {
+uint32_t save_crc(const save_t &s) { return crc_bytes(&s, offsetof(save_t, crc)); }
+
+bool slot_valid(const uint8_t *p) {
+  const save_t *s = (const save_t *)p;
   return s->magic == SAVE_MAGIC && s->crc == save_crc(*s);
+}
+
+bool slot_valid_v1(const uint8_t *p) {
+  const save_v1_t *s = (const save_v1_t *)p;
+  return s->magic == SAVE_MAGIC_V1 && s->crc == crc_bytes(s, offsetof(save_v1_t, crc));
 }
 
 save_t snapshot() {
@@ -1054,6 +1645,7 @@ save_t snapshot() {
   s.coins = pal.coins;   s.hearts = pal.hearts;
   s.face = pal.look.face; s.cap = pal.look.cap; s.shirt = pal.look.shirt;
   s.board = pal.look.board; s.skin = pal.look.skin;
+  s.best_trick = pal.best_trick; s.best_height = pal.best_height; s.best_run = pal.best_run;
   return s;
 }
 
@@ -1064,6 +1656,7 @@ void reset_pal() {
   pal.mood = 65;
   pal.coins = 20;
   pal.hearts = 0;
+  pal.best_trick = pal.best_height = pal.best_run = 0;
   pal.sleeping = false;
 }
 
@@ -1072,26 +1665,38 @@ bool load_game() {
 #ifdef NO_SAVE
   return false;
 #endif
-  const save_t *best = nullptr;
+  const uint8_t *best = nullptr;
+  bool best_is_v1 = false;
+  uint32_t best_seq = 0;
   save_next = N_SLOTS;
   for(int32_t i = 0; i < N_SLOTS; i++) {
-    const save_t *s = slot_ptr(i);
-    if(slot_valid(s) && (!best || s->seq > best->seq)) best = s;
-    if(save_next == N_SLOTS && s->magic == 0xFFFFFFFF) save_next = i;
+    const uint8_t *p = slot_ptr(i);
+    uint32_t seq = ((const uint32_t *)p)[1];
+    bool v2 = slot_valid(p), v1 = !v2 && slot_valid_v1(p);
+    if((v2 || v1) && (!best || seq > best_seq)) { best = p; best_seq = seq; best_is_v1 = v1; }
+    if(save_next == N_SLOTS && ((const uint32_t *)p)[0] == 0xFFFFFFFF) save_next = i;
   }
   if(!best) return false;
 
-  save_seq = best->seq;
-  pal.hunger = clampi(best->hunger, 0, 100);
-  pal.energy = clampi(best->energy, 0, 100);
-  pal.mood   = clampi(best->mood, 0, 100);
-  pal.coins  = clampi(best->coins, 0, 99999);
-  pal.hearts = clampi(best->hearts, 0, 9999);
-  pal.look.face  = clampi(best->face,  0, N_FACE - 1);
-  pal.look.cap   = clampi(best->cap,   0, N_CAP - 1);
-  pal.look.shirt = clampi(best->shirt, 0, N_SHIRT - 1);
-  pal.look.board = clampi(best->board, 0, N_BOARD - 1);
-  pal.look.skin  = clampi(best->skin,  0, N_COLOR - 1);
+  // both layouts start with the same fields, so read those from either
+  const save_v1_t *c = (const save_v1_t *)best;
+  save_seq = best_seq;
+  pal.hunger = clampi(c->hunger, 0, 100);
+  pal.energy = clampi(c->energy, 0, 100);
+  pal.mood   = clampi(c->mood, 0, 100);
+  pal.coins  = clampi(c->coins, 0, 99999);
+  pal.hearts = clampi(c->hearts, 0, 9999);
+  pal.look.face  = clampi(c->face,  0, N_FACE - 1);
+  pal.look.cap   = clampi(c->cap,   0, N_CAP - 1);
+  pal.look.shirt = clampi(c->shirt, 0, N_SHIRT - 1);
+  pal.look.board = clampi(c->board, 0, N_BOARD - 1);
+  pal.look.skin  = clampi(c->skin,  0, N_COLOR - 1);
+  if(!best_is_v1) {
+    const save_t *n = (const save_t *)best;
+    pal.best_trick  = clampi(n->best_trick, 0, 9999999);
+    pal.best_height = clampi(n->best_height, 0, 200);
+    pal.best_run    = clampi(n->best_run, 0, 9999999);
+  }
   pal.sleeping = false;
   last_saved = snapshot();
   return true;
@@ -1140,7 +1745,7 @@ void wipe_save() {
 // ---------------------------------------------------------------------------
 
 void tick_life() {
-  if(scr == RUN) return;
+  if(scr == RUN || scr == TRICK || scr == JUMP) return;
   if(msg_t > 0) msg_t--;
 
   if(pal.sleeping) {
@@ -1172,11 +1777,15 @@ void init() {
   if(load_game()) say("WELCOME BACK!");
 
   town_init();
+  bowl_init();
   run_start();
 }
 
 int32_t reset_hold = 0;      // frames Y has been held in the room
 screen_t last_scr = ROOM;
+
+// flash writes stall the game for a moment, so never save mid event
+bool in_event() { return scr == RUN || scr == TRICK || scr == JUMP; }
 
 void update(uint32_t tick) {
   now_f = tick;
@@ -1184,9 +1793,9 @@ void update(uint32_t tick) {
 
   // save whenever the screen changes (never mid run), and every 20 seconds
   if(scr != last_scr) {
-    if(scr != RUN) save_if_changed();
+    if(!in_event()) save_if_changed();
     last_scr = scr;
-  } else if(tick > 0 && tick % 800 == 0 && scr != RUN) {
+  } else if(tick > 0 && tick % 800 == 0 && !in_event()) {
     save_if_changed();
   }
   if(saved_flash > 0) saved_flash--;
@@ -1210,6 +1819,9 @@ void update(uint32_t tick) {
     case CREATE: update_create(); break;
     case TOWN:   update_town();   break;
     case MEET:   update_meet();   break;
+    case HUB:    update_hub();    break;
+    case TRICK:  update_trick();  break;
+    case JUMP:   update_jump();   break;
   }
 }
 
@@ -1224,6 +1836,9 @@ void draw(uint32_t tick) {
     case CREATE: draw_create(); break;
     case TOWN:   draw_town();   break;
     case MEET:   draw_meet();   break;
+    case HUB:    draw_hub();    break;
+    case TRICK:  draw_trick();  break;
+    case JUMP:   draw_jump();   break;
   }
 
   if(scr == ROOM && reset_hold > 15) {
